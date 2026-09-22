@@ -259,6 +259,101 @@ def test_escalation_flow_requests_human():
     assert "human" in result["answer"].lower()
 
 
+def test_language_detection_handles_tagalog_and_indonesian_markers():
+    from app.localization import detect_language
+
+    assert detect_language("Kamusta, kailangan ko ng business loan para sa negosyo") == "taglish"
+    assert detect_language("Halo, saya mau cicilan dan tenor untuk pembiayaan") == "indonesian"
+    assert detect_language("Hi, I need a loan and premium coverage") == "english"
+    assert detect_language("Magandang araw, I need a business loan and premium; saya mau cicilan") == "taglish"
+
+
+def test_voice_agent_localizes_filipino_greeting_and_query_flow(monkeypatch):
+    from app.voice.agent import process_voice_turn
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(kb, "retrieve", lambda question, limit=4: [{
+        "record_id": "loan_001",
+        "title": "Business Loan Overview",
+        "content": "This demo loan is intended for small businesses seeking working capital or equipment funding.",
+        "category": "product",
+        "source": "demo://loan-product-overview",
+        "version": "1.0",
+        "pii": False,
+        "similarity": 0.87,
+    }])
+
+    class AnsweringChat(DummyChat):
+        def invoke(self, messages):
+            return type("Result", (), {"content": "The demo loan supports working capital and equipment funding."})()
+
+    monkeypatch.setattr(kb, "get_chat_model", lambda: AnsweringChat())
+
+    result = process_voice_turn({
+        "message": "Kamusta, ano ang loan para sa negosyo?",
+        "market": "philippines",
+    })
+
+    assert result["status"] == "knowledge_answer"
+    assert "kamusta" in result["answer"].lower() or "loanova" in result["answer"].lower()
+    assert result["grounded"] is True
+    assert result["sources"][0]["record_id"] == "loan_001"
+
+
+def test_voice_agent_localizes_indonesian_unsupported_financial_request(monkeypatch):
+    from app.voice.agent import process_voice_turn
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(kb, "retrieve", lambda question, limit=4: [{
+        "record_id": "loan_004",
+        "title": "Interest Rates and Fees",
+        "content": "The demo knowledge base contains no approved interest rates, processing fees, repayment schedules, or final loan offers.",
+        "category": "faq",
+        "source": "demo://rates-and-fees",
+        "version": "1.0",
+        "pii": False,
+        "similarity": 0.91,
+    }])
+
+    result = process_voice_turn({
+        "message": "Halo, berapa APR dan fee untuk pembiayaan ini?",
+        "market": "indonesia",
+    })
+
+    assert result["status"] == "unsupported_question"
+    assert result["grounded"] is False
+    assert result["sources"][0]["record_id"] == "loan_004"
+    assert "tidak" in result["answer"].lower() or "unavailable" in result["answer"].lower() or "n/a" in result["answer"].lower()
+
+
+def test_voice_agent_keeps_english_q1_q2_behavior_untouched(monkeypatch):
+    from app.voice.agent import process_voice_turn
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(kb, "retrieve", lambda question, limit=4: [{
+        "record_id": "loan_001",
+        "title": "Business Loan Overview",
+        "content": "This demo loan is intended for small businesses seeking working capital or equipment funding.",
+        "category": "product",
+        "source": "demo://loan-product-overview",
+        "version": "1.0",
+        "pii": False,
+        "similarity": 0.87,
+    }])
+
+    class AnsweringChat(DummyChat):
+        def invoke(self, messages):
+            return type("Result", (), {"content": "The demo loan supports working capital and equipment funding."})()
+
+    monkeypatch.setattr(kb, "get_chat_model", lambda: AnsweringChat())
+
+    result = process_voice_turn({"message": "What is this loan for?"})
+
+    assert result["status"] == "knowledge_answer"
+    assert result["grounded"] is True
+    assert result["sources"][0]["record_id"] == "loan_001"
+
+
 def test_voice_agent_uses_grounded_kb_for_supported_question(monkeypatch):
     from app.voice.agent import process_voice_turn
 
@@ -455,3 +550,105 @@ def test_frontend_handles_backend_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="backend unavailable"):
         streamlit_app.call_voice_api("What is the APR?")
+
+
+def test_q4_signal_extraction_identifies_cross_sell_and_compliance_risks():
+    from app.audio.insights import extract_call_signals
+
+    transcript = (
+        "Customer: I also have a second vehicle. "
+        "Agent: I should disclose the policy terms before proceeding."
+    )
+
+    signals = extract_call_signals(transcript)
+    labels = {signal["category"] for signal in signals}
+
+    assert "missed_cross_sell" in labels
+    assert "compliance_gap" in labels
+    assert any(signal["confidence"] >= 0.6 for signal in signals)
+
+
+def test_q4_nudge_engine_suppresses_duplicates_and_low_confidence():
+    from app.audio.insights import generate_nudges
+
+    signals = [
+        {"category": "missed_cross_sell", "confidence": 0.91, "message": "Customer mentioned a second vehicle."},
+        {"category": "missed_cross_sell", "confidence": 0.91, "message": "Customer mentioned a second vehicle."},
+        {"category": "frustration", "confidence": 0.20, "message": "Customer sounded a bit annoyed."},
+    ]
+
+    nudges = generate_nudges(signals)
+    labels = [nudge["category"] for nudge in nudges]
+
+    assert labels.count("missed_cross_sell") == 1
+    assert "frustration" not in labels
+    assert any(nudge["priority"] >= 1 for nudge in nudges)
+
+
+def test_q4_latencies_are_reported_for_real_time_pipeline():
+    from app.audio.insights import process_live_audio_stream
+
+    result = process_live_audio_stream({
+        "call_id": "call_123",
+        "audio_chunks": [
+            {"chunk_id": "c1", "timestamp_ms": 0, "duration_ms": 1000, "transcript": "Customer: I need a callback."},
+            {"chunk_id": "c2", "timestamp_ms": 1000, "duration_ms": 1000, "transcript": "Agent: We can offer a callback."},
+        ],
+        "conversation_state": {"last_status": "ready"},
+    })
+
+    assert result["call_id"] == "call_123"
+    assert result["latency"]["p95_ms"] >= result["latency"]["p50_ms"]
+    assert result["latency"]["asr_ms"] >= 0
+    assert result["transcript"]
+    assert result["nudges"]
+
+
+def test_q4_false_positive_controls_block_ambiguous_noise():
+    from app.audio.insights import generate_nudges, extract_call_signals
+
+    noisy = "Customer: uh hmm maybe maybe I am okay. Not clear."
+    signals = extract_call_signals(noisy)
+    nudges = generate_nudges(signals)
+
+    assert signals == []
+    assert nudges == []
+
+
+def test_voice_agent_integration_keeps_q1_q2_grounding_when_live_insights_are_present(monkeypatch):
+    from app.voice.agent import process_voice_turn
+    from app.audio.insights import process_live_audio_stream
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(kb, "retrieve", lambda question, limit=4: [{
+        "record_id": "loan_001",
+        "title": "Business Loan Overview",
+        "content": "This demo loan is intended for small businesses seeking working capital or equipment funding.",
+        "category": "product",
+        "source": "demo://loan-product-overview",
+        "version": "1.0",
+        "pii": False,
+        "similarity": 0.87,
+    }])
+
+    class AnsweringChat(DummyChat):
+        def invoke(self, messages):
+            return type("Result", (), {"content": "The demo loan supports working capital and equipment funding."})()
+
+    monkeypatch.setattr(kb, "get_chat_model", lambda: AnsweringChat())
+
+    live_result = process_live_audio_stream({
+        "call_id": "call_456",
+        "audio_chunks": [{"chunk_id": "a1", "timestamp_ms": 0, "duration_ms": 2000, "transcript": "Customer: I also have a second vehicle and want to learn about the product."}],
+        "conversation_state": {"last_status": "ready"},
+    })
+
+    result = process_voice_turn({
+        "message": "What is this loan for?",
+        "conversation_state": {"last_status": "ready", "live_insights": live_result},
+    })
+
+    assert live_result["nudges"]
+    assert result["status"] == "knowledge_answer"
+    assert result["grounded"] is True
+    assert result["sources"][0]["record_id"] == "loan_001"

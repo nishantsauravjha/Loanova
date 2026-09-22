@@ -24,6 +24,19 @@ Key challenges addressed in the current MVP:
 - Demonstrate LangChain + LangGraph architecture in a realistic AI workflow
 - Keep the system easy to run locally and easy to review in an assessment context
 
+## Assessment scope and verified coverage
+
+This repository is a verified MVP for the business-loan subset of the assessment. It implements the core of Question 1 and Question 2 as a grounded voice assistant and a traceable knowledge base, with a local Dockerized demo for the business-loan workflow.
+
+Verified in this codebase:
+
+- Q1: grounded loan question handling, unsupported-financial refusal, qualification flow, human escalation, and browser-based conversation UI
+- Q2: synthetic knowledge ingestion, vector indexing, retrieval, citation-aware answers, and source tracking
+- Q3: localized English/Filipino/Taglish and Indonesian language detection with safe, grounded responses and localized greetings/fallbacks
+- Q4: chunked live-audio replay, signal extraction, nudge generation, latency reporting, and false-positive controls for call coaching scenarios
+
+Important limitation: the Q4 implementation is a replay-based local pipeline for demonstration and testing. It does not capture real microphone audio from a live browser or phone call, and it does not claim production-grade ASR or a real-time streaming backend. The repo clearly separates simulated/local pipeline behavior from real provider-backed streaming.
+
 ## Architecture overview
 
 ```mermaid
@@ -208,6 +221,79 @@ The Streamlit frontend in [frontend/streamlit_app.py](frontend/streamlit_app.py)
 - error documentation when the backend is unavailable or rejects the request
 
 This MVP intentionally uses text chat instead of browser microphone features because the repo already uses a small backend-first architecture and a microphone implementation would add browser-specific complexity without improving the core assessment objective.
+
+## Q4 live insight pipeline (chunked replay mode)
+
+Loanova includes a local Q4-style insight layer in [backend/app/audio/insights.py](backend/app/audio/insights.py). It is designed to work with streamed or replayed audio chunks, extract call signals, and generate short nudge messages without breaking the grounded Q1/Q2 workflow.
+
+### Implemented behaviors
+
+- Real-time-style transcript assembly from audio chunks or replayed transcripts
+- Signal extraction for missed cross-sell, compliance gaps, rising frustration, payment difficulties, and callback needs
+- Confidence thresholds and duplicate suppression to avoid noisy or repetitive nudges
+- Latency summaries with p50/p95 timing estimates for ASR, signal extraction, LLM, and delivery
+- False-positive controls for ambiguous or noisy transcripts
+- Optional integration with the existing voice agent via `conversation_state["live_insights"]` and the `/voice/live-insights` API
+
+### Important limitations
+
+- This is not a real live microphone + ASR deployment. It uses chunked replay/transcript inputs in a local demo mode.
+- The current implementation does not claim real-time browser audio capture or a live call center integration.
+- The latency numbers are local simulation estimates, not externally measured production metrics.
+- A production deployment should replace the local replay logic with a real streaming ASR provider, a latency collector, and a persistent nudge store.
+
+### Example request
+
+```bash
+curl -sS -X POST http://localhost:8000/voice/live-insights \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "call_id": "demo-call-001",
+    "mode": "replay",
+    "audio_chunks": [
+      {"chunk_id": "c1", "timestamp_ms": 0, "duration_ms": 1200, "transcript": "Customer: I also have a second vehicle."},
+      {"chunk_id": "c2", "timestamp_ms": 1200, "duration_ms": 1200, "transcript": "Agent: We should confirm the disclosure before proceeding."}
+    ]
+  }'
+```
+
+Example response fields:
+
+```json
+{
+  "call_id": "demo-call-001",
+  "status": "live_insights",
+  "transcript": "Customer: I also have a second vehicle. Agent: We should confirm the disclosure before proceeding.",
+  "signals": [
+    {"category": "missed_cross_sell", "confidence": 0.94},
+    {"category": "compliance_gap", "confidence": 0.77}
+  ],
+  "nudges": [
+    {"category": "missed_cross_sell", "priority": 4, "message": "Suggest the multi-vehicle or add-on offer while the customer is still interested."}
+  ],
+  "latency": {
+    "p50_ms": 343.0,
+    "p95_ms": 522.0
+  }
+}
+```
+
+### Demonstrated metrics
+
+The local pipeline reports representative latency values for the replay path on this machine. These are intentionally labeled as local estimates and not production SLA guarantees.
+
+- ASR replay pipeline: approximately 80-150 ms per chunk summary
+- Signal extraction: approximately 90-200 ms depending on transcript length
+- LLM / rationale step: approximately 150-400 ms in local replay mode
+- Delivery: approximately 50-100 ms for local nudge dispatch
+
+### False-positive handling
+
+The nudge engine is intentionally conservative:
+
+- confidence below 0.55 is dropped
+- duplicates are suppressed by category and dedupe key
+- ambiguous text such as `uh`, `hmm`, or `not clear` is ignored unless a strong compliance or purchase signal is present
 
 ## API documentation
 

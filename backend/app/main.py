@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from .agents.loan_graph import QualificationRequest, run_qualification_workflow
+from .audio.insights import AudioStreamRequest, process_live_audio_stream
 from .db.db import init_db
 from .kb.kb import answer_question, ingest_json, retrieve
 from .voice.agent import VoiceTurnRequest, process_voice_turn
@@ -80,3 +81,11 @@ def voice_conversation(payload: VoiceTurnRequest):
 @app.post("/voice/agent")
 def voice_agent(payload: VoiceTurnRequest):
     return voice_conversation(payload)
+
+
+@app.post("/voice/live-insights")
+def live_insights(payload: AudioStreamRequest):
+    try:
+        return process_live_audio_stream(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc

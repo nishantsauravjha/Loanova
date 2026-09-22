@@ -3,7 +3,9 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ..agents.loan_graph import QualificationRequest, run_qualification_workflow
+from ..audio.insights import process_live_audio_stream
 from ..kb.kb import answer_question
+from ..localization import detect_language, localize_response_text, normalize_language_hint
 
 
 UNSUPPORTED_FINANCE_TERMS = [
@@ -37,7 +39,7 @@ OBJECTION_TERMS = [
     "unhappy",
 ]
 
-ESCALATION_TERMS = [
+ESCALATION_TERMS = (
     "human",
     "agent",
     "live person",
@@ -46,7 +48,7 @@ ESCALATION_TERMS = [
     "call me back",
     "speak to someone",
     "talk to a person",
-]
+)
 
 QUALIFICATION_TERMS = [
     "need a loan",
@@ -65,8 +67,18 @@ QUALIFICATION_TERMS = [
     "human",
 ]
 
-GREETING_WORDS = {"hi", "hello", "hey", "greetings"}
-GREETING_PHRASES = ("good morning", "good afternoon", "good evening")
+GREETING_WORDS = {"hi", "hello", "hey", "greetings", "kamusta", "halo"}
+GREETING_PHRASES = (
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "magandang umaga",
+    "magandang araw",
+    "magandang hapon",
+    "selamat pagi",
+    "selamat siang",
+    "selamat sore",
+)
 
 INFO_REQUEST_PREFIXES = (
     "what is",
@@ -90,8 +102,13 @@ class VoiceTurnRequest(BaseModel):
     monthly_revenue: str | None = None
     requested_amount: str | None = None
     use_of_funds: str | None = None
+    market: str | None = None
+    language: str | None = None
     escalate: bool = False
     conversation_state: dict[str, Any] | None = None
+    audio_chunks: list[dict[str, Any]] | None = None
+    transcript: str | None = None
+    call_id: str | None = None
 
     @property
     def text(self) -> str:
@@ -130,15 +147,36 @@ def _detect_conflicts(payload: VoiceTurnRequest) -> list[str]:
     return conflicts
 
 
+LOCALIZED_QUALIFICATION_TERMS = (
+    "kailangan ko ng loan",
+    "kailangan ng loan",
+    "mau pinjaman",
+    "membutuhkan pembiayaan",
+    "cicilan",
+    "tenor",
+    "angsuran",
+    "pembiayaan",
+    "pinjaman",
+)
+
+LOCALIZED_ESCALATION_TERMS = (
+    "hubungi saya",
+    "hubungi kami",
+    "tawagan ako",
+    "call me back",
+    "mau dihubungi",
+)
+
+
 def _looks_like_qualification_intent(message: str, payload: VoiceTurnRequest) -> bool:
     normalized = _normalize_text(message)
     if not normalized:
         return False
 
-    if payload.escalate or any(term in normalized for term in ESCALATION_TERMS):
+    if payload.escalate or any(term in normalized for term in (*ESCALATION_TERMS, *LOCALIZED_ESCALATION_TERMS)):
         return True
 
-    if any(term in normalized for term in QUALIFICATION_TERMS):
+    if any(term in normalized for term in (*QUALIFICATION_TERMS, *LOCALIZED_QUALIFICATION_TERMS)):
         if any(prefix in normalized for prefix in INFO_REQUEST_PREFIXES):
             return False
         return True
@@ -196,6 +234,13 @@ def _build_qualification_payload(payload: VoiceTurnRequest) -> QualificationRequ
     )
 
 
+def _resolve_language(payload: VoiceTurnRequest, message: str) -> str:
+    explicit = payload.market or payload.language
+    if explicit:
+        return normalize_language_hint(explicit)
+    return detect_language(message)
+
+
 def process_voice_turn(payload: VoiceTurnRequest | dict[str, Any]) -> dict[str, Any]:
     if isinstance(payload, dict):
         if "message" not in payload and "question" in payload:
@@ -212,24 +257,42 @@ def process_voice_turn(payload: VoiceTurnRequest | dict[str, Any]) -> dict[str, 
             monthly_revenue=payload.monthly_revenue,
             requested_amount=payload.requested_amount,
             use_of_funds=payload.use_of_funds,
+            market=getattr(payload, "market", None),
+            language=getattr(payload, "language", None),
             escalate=payload.escalate,
             conversation_state=payload.conversation_state,
         )
 
     message = payload.text.strip()
     normalized = _normalize_text(message)
+    language = _resolve_language(payload, message)
+    live_insights: dict[str, Any] | None = None
+    if payload.audio_chunks or payload.transcript:
+        live_insights = process_live_audio_stream({
+            "call_id": payload.call_id,
+            "audio_chunks": payload.audio_chunks,
+            "transcript": payload.transcript,
+            "conversation_state": payload.conversation_state,
+            "mode": "replay",
+        })
+        state = payload.conversation_state or {}
+        state["live_insights"] = live_insights
+        payload.conversation_state = state
     if not normalized:
-        return {
+        base = {
             "status": "empty",
             "answer": "I’m ready to help with loan questions or preliminary qualification details. Please share the customer’s question or the information needed for review.",
             "grounded": False,
             "sources": [],
             "escalated": False,
         }
+        if live_insights is not None:
+            base["live_insights"] = live_insights
+        return {**base, "answer": localize_response_text(base["status"], base["answer"], language)}
 
     conflicts = _detect_conflicts(payload)
     if conflicts:
-        return {
+        result = {
             "status": "conflict",
             "answer": (
                 "I noticed conflicting information for "
@@ -241,17 +304,25 @@ def process_voice_turn(payload: VoiceTurnRequest | dict[str, Any]) -> dict[str, 
             "sources": [],
             "escalated": False,
         }
+        if live_insights is not None:
+            result["live_insights"] = live_insights
+        result["answer"] = localize_response_text(result["status"], result["answer"], language)
+        return result
 
     if _is_greeting(message):
-        return {
+        result = {
             "status": "greeting",
             "answer": "Hi! I’m Loanova. I can answer product questions, explain the preliminary qualification process, or connect you with a human specialist if needed.",
             "grounded": False,
             "sources": [],
             "escalated": False,
         }
+        if live_insights is not None:
+            result["live_insights"] = live_insights
+        result["answer"] = localize_response_text(result["status"], result["answer"], language)
+        return result
 
-    escalation_requested = payload.escalate or any(term in normalized for term in ESCALATION_TERMS)
+    escalation_requested = payload.escalate or any(term in normalized for term in (*ESCALATION_TERMS, *LOCALIZED_ESCALATION_TERMS))
     if escalation_requested:
         workflow_result = run_qualification_workflow(_build_qualification_payload(payload))
         result = {
@@ -262,23 +333,34 @@ def process_voice_turn(payload: VoiceTurnRequest | dict[str, Any]) -> dict[str, 
             "sources": [],
             "escalated": True,
         }
+        if live_insights is not None:
+            result["live_insights"] = live_insights
+        result["answer"] = localize_response_text(result["status"], result["answer"], language)
         return result
 
     if _is_unsupported_financial_question(normalized):
         answer = answer_question(message)
-        return {
+        result = {
             "status": "unsupported_question",
             **answer,
             "escalated": False,
         }
+        if live_insights is not None:
+            result["live_insights"] = live_insights
+        result["answer"] = localize_response_text(result["status"], result["answer"], language)
+        return result
 
     if _is_information_request(message):
         answer = answer_question(message)
-        return {
+        result = {
             "status": "knowledge_answer",
             **answer,
             "escalated": False,
         }
+        if live_insights is not None:
+            result["live_insights"] = live_insights
+        result["answer"] = localize_response_text(result["status"], result["answer"], language)
+        return result
 
     if _looks_like_qualification_intent(message, payload):
         workflow_result = run_qualification_workflow(_build_qualification_payload(payload))
@@ -290,6 +372,9 @@ def process_voice_turn(payload: VoiceTurnRequest | dict[str, Any]) -> dict[str, 
             "sources": [],
             "escalated": workflow_result.get("status") == "escalated",
         }
+        if live_insights is not None:
+            result["live_insights"] = live_insights
+        result["answer"] = localize_response_text(result["status"], result["answer"], language)
         if workflow_result.get("status") in {"missing_fields", "objection", "escalated"}:
             return result
         if workflow_result.get("status") == "ready_for_review":
@@ -297,7 +382,7 @@ def process_voice_turn(payload: VoiceTurnRequest | dict[str, Any]) -> dict[str, 
 
     if any(term in normalized for term in OBJECTION_TERMS):
         workflow_result = run_qualification_workflow(_build_qualification_payload(payload))
-        return {
+        result = {
             "status": workflow_result.get("status", "objection"),
             "answer": workflow_result.get("answer"),
             "missing_fields": workflow_result.get("missing_fields", []),
@@ -305,13 +390,21 @@ def process_voice_turn(payload: VoiceTurnRequest | dict[str, Any]) -> dict[str, 
             "sources": [],
             "escalated": False,
         }
+        if live_insights is not None:
+            result["live_insights"] = live_insights
+        result["answer"] = localize_response_text(result["status"], result["answer"], language)
+        return result
 
     answer = answer_question(message)
-    return {
+    result = {
         "status": "knowledge_answer",
         **answer,
         "escalated": False,
     }
+    if live_insights is not None:
+        result["live_insights"] = live_insights
+    result["answer"] = localize_response_text(result["status"], result["answer"], language)
+    return result
 
 
 def handle_voice_turn(payload: VoiceTurnRequest | dict[str, Any]) -> dict[str, Any]:
