@@ -6,10 +6,13 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "backend"
+FRONTEND = ROOT / "frontend"
 sys.path.insert(0, str(BACKEND))
+sys.path.insert(0, str(FRONTEND))
 
 from app.agents.loan_graph import run_qualification_workflow
 from app.kb import kb
+import streamlit_app
 
 
 @pytest.fixture
@@ -254,3 +257,201 @@ def test_escalation_flow_requests_human():
 
     assert result["status"] == "escalated"
     assert "human" in result["answer"].lower()
+
+
+def test_voice_agent_uses_grounded_kb_for_supported_question(monkeypatch):
+    from app.voice.agent import process_voice_turn
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(kb, "retrieve", lambda question, limit=4: [{
+        "record_id": "loan_001",
+        "title": "Business Loan Overview",
+        "content": "This demo loan is intended for small businesses seeking working capital or equipment funding.",
+        "category": "product",
+        "source": "demo://loan-product-overview",
+        "version": "1.0",
+        "pii": False,
+        "similarity": 0.87,
+    }])
+
+    class AnsweringChat(DummyChat):
+        def invoke(self, messages):
+            return type("Result", (), {"content": "The demo loan supports working capital and equipment funding."})()
+
+    monkeypatch.setattr(kb, "get_chat_model", lambda: AnsweringChat())
+
+    result = process_voice_turn({
+        "message": "What is this loan for?",
+        "conversation_state": {},
+    })
+
+    assert result["grounded"] is True
+    assert "loan_001" in result["answer"]
+    assert result["sources"][0]["record_id"] == "loan_001"
+
+
+def test_voice_agent_handles_greeting_without_kb_fallback():
+    from app.voice.agent import process_voice_turn
+
+    result = process_voice_turn({"message": "Hi"})
+
+    assert result["status"] == "greeting"
+    assert result["sources"] == []
+    assert "loanova" in result["answer"].lower()
+    assert "current knowledge base" not in result["answer"].lower()
+
+
+def test_voice_agent_answers_product_question_before_qualification_flow(monkeypatch):
+    from app.voice.agent import process_voice_turn
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(kb, "retrieve", lambda question, limit=4: [{
+        "record_id": "loan_001",
+        "title": "Business Loan Overview",
+        "content": "This demo loan is intended for small businesses seeking working capital or equipment funding.",
+        "category": "product",
+        "source": "demo://loan-product-overview",
+        "version": "1.0",
+        "pii": False,
+        "similarity": 0.87,
+    }])
+
+    class AnsweringChat(DummyChat):
+        def invoke(self, messages):
+            return type("Result", (), {"content": "The demo loan supports working capital and equipment funding."})()
+
+    monkeypatch.setattr(kb, "get_chat_model", lambda: AnsweringChat())
+
+    result = process_voice_turn({
+        "message": "What is the business loan for?",
+        "conversation_state": {},
+    })
+
+    assert result["status"] == "knowledge_answer"
+    assert result["grounded"] is True
+    assert result["sources"][0]["record_id"] == "loan_001"
+
+
+def test_voice_agent_handles_missing_information_and_objection(monkeypatch):
+    from app.voice.agent import process_voice_turn
+
+    monkeypatch.setattr(kb, "retrieve", lambda question, limit=4: [])
+
+    result = process_voice_turn({
+        "message": "I do not qualify and I need a business loan.",
+        "business_type": "",
+        "time_in_operation": "2 years",
+        "requested_amount": "",
+        "use_of_funds": "inventory",
+    })
+
+    assert result["status"] == "missing_fields"
+    assert "business_type" in result["missing_fields"] or "requested_amount" in result["missing_fields"]
+    assert "business type" in result["answer"].lower() or "requested loan amount" in result["answer"].lower()
+
+
+def test_voice_agent_escalates_human_request(monkeypatch):
+    from app.voice.agent import process_voice_turn
+
+    monkeypatch.setattr(kb, "retrieve", lambda question, limit=4: [])
+
+    result = process_voice_turn({
+        "message": "Please connect me with a live agent for a callback.",
+        "business_type": "restaurant",
+        "time_in_operation": "2 years",
+        "monthly_revenue": "75000",
+        "requested_amount": "50000",
+        "use_of_funds": "inventory",
+    })
+
+    assert result["status"] == "escalated"
+    assert result["escalated"] is True
+    assert "human" in result["answer"].lower()
+
+
+def test_voice_agent_avoids_inventing_financial_claims(monkeypatch):
+    from app.voice.agent import process_voice_turn
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(kb, "retrieve", lambda question, limit=4: [{
+        "record_id": "loan_004",
+        "title": "Interest Rates and Fees",
+        "content": "The demo knowledge base contains no approved interest rates, processing fees, repayment schedules, or final loan offers.",
+        "category": "faq",
+        "source": "demo://rates-and-fees",
+        "version": "1.0",
+        "pii": False,
+        "similarity": 0.91,
+    }])
+
+    result = process_voice_turn({
+        "message": "What is the exact APR and fee for this loan?",
+    })
+
+    assert result["grounded"] is False
+    assert result["sources"][0]["record_id"] == "loan_004"
+    assert "unavailable" in result["answer"].lower()
+
+
+def test_frontend_calls_voice_api_contract(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "status": "knowledge_answer",
+                "answer": "The demo loan supports working capital and equipment funding.",
+                "grounded": True,
+                "sources": [{
+                    "record_id": "loan_001",
+                    "title": "Business Loan Overview",
+                    "source": "demo://loan-product-overview",
+                }],
+                "escalated": False,
+            }
+
+    def fake_post(url, json, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(streamlit_app.requests, "post", fake_post)
+
+    result = streamlit_app.call_voice_api("What is this loan for?", {"last_status": "ready"})
+
+    assert captured["url"].endswith("/voice/conversation")
+    assert captured["json"]["message"] == "What is this loan for?"
+    assert captured["json"]["conversation_state"]["last_status"] == "ready"
+    assert result["grounded"] is True
+    assert result["sources"][0]["record_id"] == "loan_001"
+
+
+def test_frontend_deduplicates_relevant_sources():
+    sources = [
+        {"record_id": "loan_001", "title": "Business Loan Overview", "source": "demo://loan-product-overview"},
+        {"record_id": "loan_001", "title": "Business Loan Overview", "source": "demo://loan-product-overview"},
+        {"record_id": "loan_004", "title": "Interest Rates and Fees", "source": "demo://rates-and-fees"},
+    ]
+
+    assert len(streamlit_app.dedupe_sources(sources)) == 2
+    assert streamlit_app.strip_citation_suffix("The loan supports working capital.\n\nCitations: [loan_001] Business Loan Overview (demo://loan-product-overview)") == "The loan supports working capital."
+
+
+def test_frontend_handles_backend_error(monkeypatch):
+    class FakeResponse:
+        status_code = 500
+        text = '{"detail": "backend unavailable"}'
+
+        def json(self):
+            return {"detail": "backend unavailable"}
+
+    def fake_post(url, json, timeout):
+        return FakeResponse()
+
+    monkeypatch.setattr(streamlit_app.requests, "post", fake_post)
+
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        streamlit_app.call_voice_api("What is the APR?")

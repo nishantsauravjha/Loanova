@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from .agents.loan_graph import QualificationRequest, run_qualification_workflow
 from .db.db import init_db
 from .kb.kb import answer_question, ingest_json, retrieve
+from .voice.agent import VoiceTurnRequest, process_voice_turn
 
 
 @asynccontextmanager
@@ -66,3 +67,16 @@ def qualification(payload: QualificationRequest):
 @app.post("/agent/loan-qualification")
 def loan_qualification(payload: QualificationRequest):
     return qualification(payload)
+
+
+@app.post("/voice/conversation")
+def voice_conversation(payload: VoiceTurnRequest):
+    try:
+        return process_voice_turn(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/voice/agent")
+def voice_agent(payload: VoiceTurnRequest):
+    return voice_conversation(payload)

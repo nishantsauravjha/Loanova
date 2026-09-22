@@ -47,7 +47,7 @@ flowchart LR
 - Pydantic: request/response validation
 - Docker Compose: local service orchestration for PostgreSQL and backend
 - pytest: regression testing
-- Streamlit: frontend scaffold present but not implemented in the current MVP
+- Streamlit: simple browser-based conversation interface for the existing voice-agent API
 
 ## Component responsibilities
 
@@ -59,7 +59,8 @@ flowchart LR
 - `backend/app/agents/prompts.py`: instructional prompt text for safer assistant behavior
 - `data/raw/loan_knowledge.json`: synthetic loan knowledge used by the system
 - `docker-compose.yml`: PostgreSQL and backend container orchestration
-- `frontend/streamlit_app.py`: frontend scaffold present, currently empty in this repo
+- `frontend/streamlit_app.py`: browser-based conversation UI for the `/voice/conversation` API
+- `frontend/requirements.txt`: frontend-only dependencies for the Streamlit app
 - `tests/test_ai_assessment.py`: regression tests covering retrieval, citations, fallbacks, and workflow logic
 
 ## Repository structure
@@ -88,6 +89,7 @@ flowchart LR
 │       └── loan_knowledge.json
 ├── frontend/
 │   ├── Dockerfile
+│   ├── requirements.txt
 │   └── streamlit_app.py
 ├── tests/
 │   └── test_ai_assessment.py
@@ -145,23 +147,29 @@ DATABASE_URL=postgresql://app:app_password@db:5432/assessment
 
 ## Docker setup
 
-This project includes Docker Compose support for PostgreSQL and the backend service.
+This project includes Docker Compose support for PostgreSQL, the backend service, and the Streamlit conversation UI.
 
-Start the database and backend:
+Start the full stack:
 
 ```bash
-docker compose up -d --build backend
+docker compose up -d --build
 ```
 
-This starts the PostgreSQL container and the FastAPI application. The database is persisted with a Docker volume named `pgdata`.
+This starts the PostgreSQL container, the FastAPI backend, and the frontend UI. The database is persisted with a Docker volume named `pgdata`.
 
-To inspect logs:
+To inspect backend logs:
 
 ```bash
 docker compose logs --tail=60 backend
 ```
 
-To check health:
+To inspect the frontend logs:
+
+```bash
+docker compose logs --tail=60 frontend
+```
+
+To check backend health:
 
 ```bash
 curl http://localhost:8000/health
@@ -172,6 +180,34 @@ Expected response:
 ```json
 {"status":"ok"}
 ```
+
+The conversation frontend is available at:
+
+```text
+http://localhost:8501
+```
+
+### Verified startup flow
+
+```bash
+docker compose up -d --build
+curl http://localhost:8000/health
+curl http://localhost:8501/
+```
+
+If the Streamlit UI does not connect to the backend in a browser, make sure the app is running in Docker Compose and that `LOANOVA_API_URL` points to the backend service name from the container (`http://backend:8000`) or the host machine (`http://localhost:8000`) depending on where the app is started. The backend is the source of truth for the voice contract.
+
+## Frontend conversation UI
+
+The Streamlit frontend in [frontend/streamlit_app.py](frontend/streamlit_app.py) connects to the existing `/voice/conversation` API and shows:
+
+- user and assistant messages in a chat layout
+- loading state while the backend answer is being generated
+- visible citations and evidence when the response includes them
+- a reset button for a fresh conversation
+- error documentation when the backend is unavailable or rejects the request
+
+This MVP intentionally uses text chat instead of browser microphone features because the repo already uses a small backend-first architecture and a microphone implementation would add browser-specific complexity without improving the core assessment objective.
 
 ## API documentation
 
@@ -278,6 +314,34 @@ Example response:
 }
 ```
 
+### Voice conversation agent
+
+```http
+POST /voice/conversation
+```
+
+Request body:
+
+```json
+{
+  "message": "I need a loan for inventory growth.",
+  "conversation_state": {}
+}
+```
+
+Response shape:
+
+```json
+{
+  "status": "missing_fields",
+  "answer": "I need a few preliminary details before I can continue: business type, time in operation, monthly revenue, requested loan amount, and use of funds. This is a synthetic demo workflow and does not imply approval.",
+  "missing_fields": ["business_type", "time_in_operation", "monthly_revenue", "requested_amount"],
+  "sources": [],
+  "grounded": false,
+  "escalated": false
+}
+```
+
 ### Qualification workflow
 
 ```http
@@ -320,29 +384,31 @@ source venv/bin/activate
 python -m pytest -q
 ```
 
-The current suite checks the answer flow, citations, unsupported-rate safety behavior, and the qualification workflow.
+The current suite checks the answer flow, citations, unsupported-rate safety behavior, the qualification workflow, and the frontend-to-backend conversation integration.
 
 ## Demo workflow
 
 A simple end-to-end flow looks like this:
 
-1. Start the database and backend with Docker Compose.
-2. Call `/kb/ingest` to load the synthetic knowledge base.
-3. Search for a topic with `/kb/search`.
-4. Ask a question with `/kb/answer`.
-5. If more structure is needed, submit a preliminary qualification request to `/agent/qualification`.
+1. Start the full stack with Docker Compose.
+2. Open the Streamlit interface at http://localhost:8501.
+3. Ask a simple product or policy question in the chat UI.
+4. Call `/kb/ingest` if you want to refresh the synthetic knowledge base.
+5. Use the text input to ask about the product, a qualification detail, or a callback request.
 6. If the user asks for a callback or escalates, the workflow responds with human follow-up guidance rather than making promises.
 
 Example:
 
 ```bash
+docker compose up -d --build
+
 curl -X POST http://localhost:8000/kb/search \
   -H 'Content-Type: application/json' \
   -d '{"question":"What is the business loan for?"}'
 
-curl -X POST http://localhost:8000/kb/answer \
+curl -X POST http://localhost:8000/voice/conversation \
   -H 'Content-Type: application/json' \
-  -d '{"question":"What is the APR?"}'
+  -d '{"message":"I need a business loan for inventory growth.","conversation_state":{}}'
 ```
 
 ## Safety boundaries and known limitations

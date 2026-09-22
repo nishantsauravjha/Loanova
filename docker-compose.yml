@@ -29,5 +29,14 @@ services:
       - ./backend:/app
       - ./data:/data
 
+  frontend:
+    build: ./frontend
+    environment:
+      LOANOVA_API_URL: http://backend:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
+
 volumes:
   pgdata:
