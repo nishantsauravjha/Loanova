@@ -1,0 +1,51 @@
+
+[
+  {
+    "record_id": "loan_001",
+    "title": "Business Loan Overview",
+    "category": "product",
+    "source": "demo://loan-product-overview",
+    "version": "1.0",
+    "content": "The demo business loan is intended for small businesses seeking funds for working capital, equipment, or business expansion. The assistant must explain that this is a fictional demonstration product and not an actual lending offer."
+  },
+  {
+    "record_id": "loan_002",
+    "title": "Illustrative Qualification Criteria",
+    "category": "qualification",
+    "source": "demo://qualification-rules",
+    "version": "1.0",
+    "content": "For this fictional demo, a lead should provide business type, time in operation, approximate monthly revenue, requested loan amount, and intended use of funds. Collecting these details is preliminary qualification only and does not constitute approval."
+  },
+  {
+    "record_id": "loan_003",
+    "title": "Application Documentation",
+    "category": "policy",
+    "source": "demo://documentation-policy",
+    "version": "1.0",
+    "content": "Illustrative documents that a lender might request include business registration details, identity documents, bank statements, and financial records. Actual requirements depend on the lender. The demo assistant must not claim these documents are sufficient for approval."
+  },
+  {
+    "record_id": "loan_004",
+    "title": "Interest Rates and Fees",
+    "category": "faq",
+    "source": "demo://rates-and-fees",
+    "version": "1.0",
+    "content": "The demo knowledge base contains no approved interest rates, processing fees, repayment schedules, or final loan offers. The assistant must state that these details are unavailable rather than inventing numbers."
+  },
+  {
+    "record_id": "loan_005",
+    "title": "Objection: Concern About Eligibility",
+    "category": "objection",
+    "source": "demo://eligibility-objection",
+    "version": "1.0",
+    "content": "If a caller is unsure whether their business qualifies, acknowledge the concern and explain that the assistant can collect preliminary details. Do not guarantee eligibility or approval. Offer human follow-up if requested."
+  },
+  {
+    "record_id": "loan_006",
+    "title": "Human Escalation",
+    "category": "policy",
+    "source": "demo://human-escalation",
+    "version": "1.0",
+    "content": "If the caller asks for a human, requests a callback, disputes a policy explanation, or asks for an unsupported financial commitment, offer human assistance. Do not claim a callback has been scheduled unless the scheduling action succeeds."
+  }
+]
