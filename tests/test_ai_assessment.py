@@ -12,7 +12,9 @@ sys.path.insert(0, str(FRONTEND))
 
 from app.agents.loan_graph import run_qualification_workflow
 from app.kb import kb
+from app.main import app
 import streamlit_app
+from fastapi.testclient import TestClient
 
 
 @pytest.fixture
@@ -65,6 +67,40 @@ class DummyChat:
         return type("Result", (), {"content": content})()
 
 
+def test_build_voice_component_html_includes_browser_voice_contract():
+    html = streamlit_app.build_voice_component_html("http://localhost:8000/voice/conversation")
+
+    assert "SpeechRecognition" in html
+    assert "/voice/conversation" in html
+    assert "Microphone permission denied" in html
+    assert "speechSynthesis" in html
+    assert "Browser speech recognition and synthesis are supported only in modern browsers" in html
+
+
+def test_q1_real_call_recording_template_has_three_calls_and_no_fabrication_claims():
+    template = ROOT / "docs" / "q1_real_call_recording_template.md"
+    assert template.exists()
+    text = template.read_text(encoding="utf-8")
+    assert "Call 1" in text and "Call 2" in text and "Call 3" in text
+    assert "No fabricated" in text or "do not fabricate" in text.lower()
+    assert "browser" in text.lower() and "voice" in text.lower()
+
+
+def test_build_voice_component_html_uses_explicit_voice_selection_and_missing_voice_warning():
+    html = streamlit_app.build_voice_component_html("http://localhost:8000/voice/conversation")
+
+    assert "loanova-voice-select" in html
+    assert "voiceschanged" in html
+    assert "getVoices" in html
+    assert "voiceSelect.value" in html
+    assert "utterance.voice = matchingVoice" in html
+    assert "No suitable English voice available. Using the browser default voice is not high quality on this browser." in html
+    assert "rate = 1.0" in html
+    assert "pitch = 1.0" in html
+    assert "window.speechSynthesis.cancel()" in html
+    assert "voice.name === selectedVoiceName" in html
+
+
 def test_vector_store_initializes_with_langchain_postgres_signature(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     captured = {}
@@ -86,6 +122,34 @@ def test_vector_store_initializes_with_langchain_postgres_signature(monkeypatch)
     assert captured["collection_name"] == "loan_knowledge_demo"
     assert captured["create_extension"] is False
     assert captured["connection"].startswith("postgresql+psycopg://")
+
+
+def test_prepare_records_for_ingestion_cleans_deduplicates_and_flags_pii():
+    records = [
+        {
+            "record_id": "loan_099",
+            "title": "  Example Loan  ",
+            "category": "product",
+            "source": "demo://example",
+            "version": "1.0",
+            "content": "  The demo loan is for   small businesses.  Contact jamie@example.com for details.  ",
+        },
+        {
+            "record_id": "loan_099",
+            "title": "Example Loan",
+            "category": "product",
+            "source": "demo://example",
+            "version": "1.0",
+            "content": "The demo loan is for small businesses. Contact jamie@example.com for details.",
+        },
+    ]
+
+    cleaned = kb.prepare_records_for_ingestion(records)
+
+    assert len(cleaned) == 1
+    assert cleaned[0]["title"] == "Example Loan"
+    assert cleaned[0]["content"] == "The demo loan is for small businesses. Contact [email redacted] for details."
+    assert cleaned[0]["pii"] is True
 
 
 def test_ingest_json_stores_chunks_and_metadata(monkeypatch, synthetic_records):
@@ -142,6 +206,170 @@ def test_retrieve_returns_traceable_metadata(monkeypatch, synthetic_records):
     assert results[0]["title"] == "Business Loan Overview"
     assert results[0]["source"] == "demo://loan-product-overview"
     assert "pii" in results[0]
+
+
+def test_document_upload_ingestion_parses_clean_chunks_and_is_retrievable(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    created = {}
+
+    class FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, *args, **kwargs):
+            pass
+
+        def commit(self):
+            pass
+
+    class FakeStore:
+        def __init__(self):
+            self.docs = []
+
+        def add_documents(self, docs, ids=None):
+            created["docs"] = docs
+            created["ids"] = ids or []
+
+        def similarity_search_with_score(self, question, k=4):
+            return [
+                (
+                    type(
+                        "Doc",
+                        (),
+                        {
+                            "page_content": "This uploaded business loan policy supports working capital and equipment funding.",
+                            "metadata": {
+                                "record_id": "upload_001",
+                                "title": "Uploaded Policy",
+                                "category": "product",
+                                "source": "uploaded://loan-policy",
+                                "version": "1.0",
+                                "pii": False,
+                            },
+                        },
+                    )(),
+                    0.08,
+                )
+            ]
+
+    monkeypatch.setattr(kb, "get_embeddings", lambda: DummyEmbeddings())
+    monkeypatch.setattr(kb, "get_vector_store", lambda: FakeStore())
+    monkeypatch.setattr(kb, "get_connection", lambda: FakeConn())
+
+    document_path = tmp_path / "loan_policy.txt"
+    document_path.write_text(
+        "The uploaded business loan policy supports working capital and equipment funding for small businesses. Contact customer@example.com for details.",
+        encoding="utf-8",
+    )
+
+    result = kb.ingest_document_file(
+        str(document_path),
+        title="Uploaded Policy",
+        category="product",
+        source="uploaded://loan-policy",
+    )
+    retrieved = kb.retrieve("What does the uploaded policy support?", limit=1)
+
+    assert result["ingested_records"] == 1
+    assert created["docs"]
+    assert created["docs"][0].metadata["source"] == "uploaded://loan-policy"
+    assert retrieved[0]["source"] == "uploaded://loan-policy"
+    assert retrieved[0]["record_id"] == "upload_001"
+
+
+def test_readable_pdf_document_upload_ingestion_parses_and_redacts_pii(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    created = {}
+
+    from reportlab.pdfgen import canvas
+
+    pdf_path = tmp_path / "loan_policy.pdf"
+    c = canvas.Canvas(str(pdf_path))
+    c.drawString(50, 750, "The demo business loan supports working capital and equipment funding for small businesses.")
+    c.drawString(50, 730, "Contact customer@example.com for details.")
+    c.save()
+
+    class FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, *args, **kwargs):
+            pass
+
+        def commit(self):
+            pass
+
+    class FakeStore:
+        def __init__(self):
+            self.docs = []
+
+        def add_documents(self, docs, ids=None):
+            created["docs"] = docs
+            created["ids"] = ids or []
+
+    monkeypatch.setattr(kb, "get_embeddings", lambda: DummyEmbeddings())
+    monkeypatch.setattr(kb, "get_vector_store", lambda: FakeStore())
+    monkeypatch.setattr(kb, "get_connection", lambda: FakeConn())
+
+    result = kb.ingest_document_file(
+        str(pdf_path),
+        title="PDF policy",
+        category="product",
+        source="uploaded://pdf-policy",
+    )
+
+    assert result["ingested_records"] == 1
+    assert created["docs"]
+    assert created["docs"][0].metadata["source"] == "uploaded://pdf-policy"
+    assert "working capital" in created["docs"][0].page_content.lower()
+    assert "customer@example.com" not in created["docs"][0].page_content
+
+
+def test_empty_pdf_document_upload_fails_without_placeholder(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    from pypdf import PdfWriter
+
+    pdf_path = tmp_path / "empty_policy.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.write(str(pdf_path))
+
+    with pytest.raises(ValueError, match="No readable text was extracted|OCR is not supported"):
+        kb.ingest_document_file(
+            str(pdf_path),
+            title="Empty PDF policy",
+            category="product",
+            source="uploaded://empty-pdf-policy",
+        )
+
+
+def test_api_empty_pdf_upload_returns_422_with_clear_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    from pypdf import PdfWriter
+
+    pdf_path = tmp_path / "empty_policy.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.write(str(pdf_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/kb/ingest/file",
+            files={"file": ("empty_policy.pdf", pdf_path.read_bytes(), "application/pdf")},
+            data={"title": "Empty PDF policy", "category": "product", "source": "uploaded://empty-pdf-policy"},
+        )
+
+    assert response.status_code == 422
+    assert "No readable text was extracted" in response.json()["detail"]
+    assert "OCR is not supported" in response.json()["detail"]
 
 
 def test_answer_question_includes_citations(monkeypatch):
@@ -268,6 +496,18 @@ def test_language_detection_handles_tagalog_and_indonesian_markers():
     assert detect_language("Magandang araw, I need a business loan and premium; saya mau cicilan") == "taglish"
 
 
+def test_language_selection_aliases_are_explicit_and_stable():
+    from app.localization import browser_locale_for_language, normalize_language_hint
+
+    assert normalize_language_hint("English") == "english"
+    assert normalize_language_hint("fil-PH") == "filipino"
+    assert normalize_language_hint("Tagalog") == "filipino"
+    assert normalize_language_hint("taglish") == "taglish"
+    assert normalize_language_hint("Bahasa Indonesia") == "indonesian"
+    assert browser_locale_for_language("filipino") == "fil-PH"
+    assert browser_locale_for_language("indonesian") == "id-ID"
+
+
 def test_voice_agent_localizes_filipino_greeting_and_query_flow(monkeypatch):
     from app.voice.agent import process_voice_turn
 
@@ -300,6 +540,38 @@ def test_voice_agent_localizes_filipino_greeting_and_query_flow(monkeypatch):
     assert result["sources"][0]["record_id"] == "loan_001"
 
 
+def test_voice_agent_supports_explicit_taglish_language_selection_and_mixed_language_input(monkeypatch):
+    from app.voice.agent import process_voice_turn
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(kb, "retrieve", lambda question, limit=4: [{
+        "record_id": "loan_001",
+        "title": "Business Loan Overview",
+        "content": "This demo loan is intended for small businesses seeking working capital or equipment funding.",
+        "category": "product",
+        "source": "demo://loan-product-overview",
+        "version": "1.0",
+        "pii": False,
+        "similarity": 0.87,
+    }])
+
+    class AnsweringChat(DummyChat):
+        def invoke(self, messages):
+            return type("Result", (), {"content": "The demo loan supports working capital and equipment funding."})()
+
+    monkeypatch.setattr(kb, "get_chat_model", lambda: AnsweringChat())
+
+    result = process_voice_turn({
+        "message": "Halo, what is the business loan for a small business?",
+        "language": "taglish",
+    })
+
+    assert result["status"] == "knowledge_answer"
+    assert result["grounded"] is True
+    assert result["sources"][0]["record_id"] == "loan_001"
+    assert "loanova" in result["answer"].lower() or "business" in result["answer"].lower()
+
+
 def test_voice_agent_localizes_indonesian_unsupported_financial_request(monkeypatch):
     from app.voice.agent import process_voice_turn
 
@@ -324,6 +596,30 @@ def test_voice_agent_localizes_indonesian_unsupported_financial_request(monkeypa
     assert result["grounded"] is False
     assert result["sources"][0]["record_id"] == "loan_004"
     assert "tidak" in result["answer"].lower() or "unavailable" in result["answer"].lower() or "n/a" in result["answer"].lower()
+
+
+def test_q3_language_examples_and_capability_matrix_cover_required_markets():
+    from app import localization
+
+    filipino = localization.language_examples_for_market("filipino")
+    taglish = localization.language_examples_for_market("taglish")
+    indonesian = localization.language_examples_for_market("indonesian")
+
+    assert len(filipino) >= 3
+    assert len(taglish) >= 3
+    assert len(indonesian) >= 3
+    assert all("kamusta" in example.lower() or "magandang" in example.lower() or "pwede" in example.lower() for example in filipino)
+    assert "business" in " ".join(taglish).lower()
+    assert all("halo" in example.lower() or "saya" in example.lower() or "apakah" in example.lower() for example in indonesian)
+
+    filipino_capabilities = localization.get_market_voice_capabilities("filipino")
+    indonesian_capabilities = localization.get_market_voice_capabilities("indonesian")
+
+    assert filipino_capabilities["browser_locale"] == "fil-PH"
+    assert indonesian_capabilities["browser_locale"] == "id-ID"
+    assert "browser" in filipino_capabilities["asr"].lower()
+    assert "browser" in indonesian_capabilities["tts"].lower()
+    assert "not guaranteed" in indonesian_capabilities["tts"].lower() or "not guaranteed" in filipino_capabilities["tts"].lower()
 
 
 def test_voice_agent_keeps_english_q1_q2_behavior_untouched(monkeypatch):
@@ -352,6 +648,15 @@ def test_voice_agent_keeps_english_q1_q2_behavior_untouched(monkeypatch):
     assert result["status"] == "knowledge_answer"
     assert result["grounded"] is True
     assert result["sources"][0]["record_id"] == "loan_001"
+
+
+def test_browser_voice_component_reports_locale_fallback_behavior():
+    html = streamlit_app.build_voice_component_html("http://localhost:8000/voice/conversation")
+
+    assert "fil-PH" in html
+    assert "id-ID" in html
+    assert "text input remains available" in html.lower()
+    assert "loanova-language-select" in html
 
 
 def test_voice_agent_uses_grounded_kb_for_supported_question(monkeypatch):
@@ -488,6 +793,12 @@ def test_voice_agent_avoids_inventing_financial_claims(monkeypatch):
     assert "unavailable" in result["answer"].lower()
 
 
+def test_frontend_uses_host_browser_backend_url_when_backend_service_name_is_present(monkeypatch):
+    monkeypatch.setenv("LOANOVA_API_URL", "http://backend:8000")
+
+    assert streamlit_app.get_voice_api_url() == "http://localhost:8000/voice/conversation"
+
+
 def test_frontend_calls_voice_api_contract(monkeypatch):
     captured = {}
 
@@ -585,6 +896,19 @@ def test_q4_nudge_engine_suppresses_duplicates_and_low_confidence():
     assert any(nudge["priority"] >= 1 for nudge in nudges)
 
 
+def test_q4_nudge_engine_respects_cooldown_window():
+    from app.audio.insights import generate_nudges
+
+    signals = [
+        {"category": "missed_cross_sell", "confidence": 0.91, "message": "Customer mentioned a second vehicle.", "timestamp_ms": 2000},
+    ]
+    history = [{"category": "missed_cross_sell", "timestamp_ms": 0, "message": "Previous second-vehicle signal"}]
+
+    nudges = generate_nudges(signals, history=history)
+
+    assert nudges == []
+
+
 def test_q4_latencies_are_reported_for_real_time_pipeline():
     from app.audio.insights import process_live_audio_stream
 
@@ -613,6 +937,18 @@ def test_q4_false_positive_controls_block_ambiguous_noise():
 
     assert signals == []
     assert nudges == []
+
+
+def test_q4_frustration_signal_is_detected_and_nudged():
+    from app.audio.insights import extract_call_signals, generate_nudges
+
+    transcript = "Customer: I am upset and frustrated because I need a callback."
+    signals = extract_call_signals(transcript)
+    nudges = generate_nudges(signals)
+
+    assert any(signal["category"] == "frustration" for signal in signals)
+    assert any(nudge["category"] == "frustration" for nudge in nudges)
+    assert any(nudge["priority"] >= 3 for nudge in nudges)
 
 
 def test_voice_agent_integration_keeps_q1_q2_grounding_when_live_insights_are_present(monkeypatch):

@@ -28,12 +28,18 @@ Key challenges addressed in the current MVP:
 
 This repository is a verified MVP for the business-loan subset of the assessment. It implements the core of Question 1 and Question 2 as a grounded voice assistant and a traceable knowledge base, with a local Dockerized demo for the business-loan workflow.
 
+Assessment-readiness note: the Q1–Q4 code paths are implemented and covered by the repo’s regression suite, but Q4 remains a replay/local-simulation pipeline and real multilingual browser/audio validation still requires manual browser verification. The repository does not claim a production telephony backend, real ASR service, or recorded live call artifacts unless they are generated and added manually.
+
 Verified in this codebase:
 
 - Q1: grounded loan question handling, unsupported-financial refusal, qualification flow, human escalation, and browser-based conversation UI
 - Q2: synthetic knowledge ingestion, vector indexing, retrieval, citation-aware answers, and source tracking
 - Q3: localized English/Filipino/Taglish and Indonesian language detection with safe, grounded responses and localized greetings/fallbacks
 - Q4: chunked live-audio replay, signal extraction, nudge generation, latency reporting, and false-positive controls for call coaching scenarios
+
+See the actual local KB retrieval audit in [docs/q2_retrieval_evaluation.md](docs/q2_retrieval_evaluation.md).
+
+For a compact browser-call test pack aligned to the current implementation and the assessment checklist, see [docs/call_test_plan.md](docs/call_test_plan.md).
 
 Important limitation: the Q4 implementation is a replay-based local pipeline for demonstration and testing. It does not capture real microphone audio from a live browser or phone call, and it does not claim production-grade ASR or a real-time streaming backend. The repo clearly separates simulated/local pipeline behavior from real provider-backed streaming.
 
@@ -118,6 +124,44 @@ Before running the project locally, ensure you have:
 - Docker Desktop installed and running
 - An OpenAI API key with access to the configured embeddings and chat model
 - Git
+
+## Q2 document ingestion and retrieval (verified)
+
+The repo supports two ingestion paths:
+
+1. JSON ingestion using the existing KB helper:
+
+```bash
+PYTHONPATH=backend python - <<'PY'
+from app.kb.kb import ingest_json
+result = ingest_json('data/raw/loan_knowledge.json')
+print(result)
+PY
+```
+
+2. Direct document upload to the backend API for supported text-like files and PDFs. The current implementation accepts `.txt`, `.md`, `.csv`, `.json`, and `.pdf` uploads, cleans obvious PII, chunks the content, embeds it, indexes it in pgvector, and makes it available to the Q1 knowledge-grounded voice flow.
+
+```bash
+curl -X POST http://localhost:8000/kb/ingest/file \
+  -F "file=@./data/raw/loan_knowledge.json" \
+  -F "title=Loan knowledge upload" \
+  -F "category=product" \
+  -F "source=uploaded://loan-knowledge"
+```
+
+Then search or answer using the existing KB routes:
+
+```bash
+curl -sS -X POST http://localhost:8000/kb/search \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"What is the demo business loan intended for?"}'
+
+curl -sS -X POST http://localhost:8000/kb/answer \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"What is the demo business loan intended for?"}'
+```
+
+This is a minimal ingestion path for the assessment repo: the documents are parsed and indexed, then the voice agent retrieves them through the same `retrieve()`/`answer_question()` flow already used by the Q1 assistant.
 
 ## Local setup
 
@@ -220,7 +264,9 @@ The Streamlit frontend in [frontend/streamlit_app.py](frontend/streamlit_app.py)
 - a reset button for a fresh conversation
 - error documentation when the backend is unavailable or rejects the request
 
-This MVP intentionally uses text chat instead of browser microphone features because the repo already uses a small backend-first architecture and a microphone implementation would add browser-specific complexity without improving the core assessment objective.
+The supported calling method for this assessment is the browser voice UI in [frontend/streamlit_app.py](frontend/streamlit_app.py). It uses the browser’s Web Speech API for transcription and speech synthesis at http://localhost:8501, not a public PSTN/VoIP telephony number. The app can be used for real browser-based testing when the local machine has a compatible browser and microphone permissions. Actual call recordings, transcripts, and outcomes must be captured manually and stored as evidence in the repo or a local testing folder.
+
+This is not a real telephony deployment: there is no phone number, IVR stack, or production call routing in the project.
 
 ## Q4 live insight pipeline (chunked replay mode)
 

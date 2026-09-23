@@ -175,6 +175,17 @@ def generate_nudges(signals: list[dict[str, Any]], history: list[dict[str, Any]]
     deduped: list[dict[str, Any]] = []
     seen_categories: set[str] = set()
     prior_keys: set[str] = {item.get("dedupe_key", "") for item in (history or []) if item.get("dedupe_key")}
+    recent_by_category: dict[str, int] = {}
+
+    for item in history or []:
+        category = str(item.get("category", "")).strip()
+        timestamp = item.get("timestamp_ms")
+        if not category or timestamp is None:
+            continue
+        try:
+            recent_by_category[category] = max(recent_by_category.get(category, 0), int(float(timestamp)))
+        except (TypeError, ValueError):
+            continue
 
     for signal in signals or []:
         category = str(signal.get("category", "")).strip()
@@ -182,9 +193,19 @@ def generate_nudges(signals: list[dict[str, Any]], history: list[dict[str, Any]]
         if not category or confidence < DEFAULT_NUDGE_THRESHOLD:
             continue
 
+        timestamp_ms = signal.get("timestamp_ms")
+        try:
+            normalized_time = int(float(timestamp_ms)) if timestamp_ms is not None else None
+        except (TypeError, ValueError):
+            normalized_time = None
+
         dedupe_key = f"{category}:{str(signal.get('message', '')).lower()}"
         if category in seen_categories or dedupe_key in prior_keys:
             continue
+        if normalized_time is not None and category in recent_by_category:
+            last_seen = recent_by_category.get(category, 0)
+            if normalized_time - last_seen <= DEFAULT_DUPLICATE_WINDOW_MS:
+                continue
 
         template_map = {
             "missed_cross_sell": "Suggest the multi-vehicle or add-on offer while the customer is still interested.",
@@ -202,9 +223,12 @@ def generate_nudges(signals: list[dict[str, Any]], history: list[dict[str, Any]]
                 "confidence": round(confidence, 2),
                 "priority": SIGNAL_PRIORITY.get(category, 2),
                 "dedupe_key": dedupe_key,
+                "timestamp_ms": normalized_time,
             }
         )
         seen_categories.add(category)
+        if normalized_time is not None:
+            recent_by_category[category] = normalized_time
 
     deduped.sort(key=lambda item: (-item["priority"], -item["confidence"]))
     return deduped
@@ -241,11 +265,79 @@ def _simulate_latency_values(chunks: list[dict[str, Any]], transcript: str, nudg
     }
 
 
+def evaluate_chunked_replay(
+    chunks: list[dict[str, Any]],
+    call_id: str | None = None,
+    conversation_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    ordered_chunks = list(chunks or [])
+    transcript_parts: list[str] = []
+    chunk_events: list[dict[str, Any]] = []
+    prior_nudges: list[dict[str, Any]] = []
+    all_latencies: list[float] = []
+
+    for index, chunk in enumerate(ordered_chunks):
+        text = str(chunk.get("transcript") or chunk.get("text") or "").strip()
+        if text:
+            transcript_parts.append(text)
+        cumulative_transcript = " ".join(transcript_parts).strip()
+        partial_signals = extract_call_signals(cumulative_transcript, conversation_state or {})
+        partial_nudges = generate_nudges(partial_signals, prior_nudges)
+        prior_nudges.extend(partial_nudges)
+
+        duration_ms = float(chunk.get("duration_ms") or 0.0 or 800.0)
+        processing_latency_ms = max(
+            30.0,
+            (duration_ms * 0.18) + (len(text.split()) * 7.5) + (len(partial_nudges) * 20.0),
+        )
+        all_latencies.append(processing_latency_ms)
+
+        chunk_events.append(
+            {
+                "chunk_index": index,
+                "chunk_id": chunk.get("chunk_id") or f"chunk_{index}",
+                "timestamp_ms": int(chunk.get("timestamp_ms") or (index * 1000)),
+                "duration_ms": round(duration_ms, 2),
+                "transcript": text,
+                "signals": partial_signals,
+                "active_nudges": partial_nudges,
+                "processing_latency_ms": round(processing_latency_ms, 2),
+            }
+        )
+
+    cumulative_transcript = " ".join(transcript_parts).strip()
+    final_signals = extract_call_signals(cumulative_transcript, conversation_state or {})
+    final_nudges = generate_nudges(final_signals)
+    latency = {
+        "asr_ms": round(sum(event["duration_ms"] for event in chunk_events) / max(1, len(chunk_events)), 2),
+        "signal_ms": round(len(cumulative_transcript.split()) * 4.0, 2),
+        "llm_ms": round(len(cumulative_transcript.split()) * 6.0, 2),
+        "delivery_ms": round(50.0 + (len(final_nudges) * 30.0), 2),
+        "p50_ms": round(_percentile(all_latencies, 0.50), 2),
+        "p95_ms": round(_percentile(all_latencies, 0.95), 2),
+        "total_ms": round(sum(all_latencies), 2),
+    }
+
+    return {
+        "call_id": call_id,
+        "status": "live_insights",
+        "mode": "replay",
+        "transcript": cumulative_transcript,
+        "signals": final_signals,
+        "nudges": final_nudges,
+        "chunk_events": chunk_events,
+        "latency": latency,
+        "pipeline": "chunked_replay",
+        "notes": "This is a chunked replay / local pipeline simulation; real microphone capture would require an ASR provider and a streaming transport.",
+        "confidence_threshold": DEFAULT_NUDGE_THRESHOLD,
+    }
+
+
 def process_live_audio_stream(payload: dict[str, Any] | AudioStreamRequest) -> dict[str, Any]:
     request = payload if isinstance(payload, AudioStreamRequest) else AudioStreamRequest(**payload)
     chunks = request.audio_chunks or []
     transcript = request.transcript or _compile_transcript(chunks)
-    if not transcript:
+    if not transcript and not chunks:
         return {
             "call_id": request.call_id,
             "status": "idle",
@@ -256,6 +348,14 @@ def process_live_audio_stream(payload: dict[str, Any] | AudioStreamRequest) -> d
             "latency": {"asr_ms": 0.0, "signal_ms": 0.0, "llm_ms": 0.0, "delivery_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0, "total_ms": 0.0},
             "pipeline": "chunked_replay",
             "notes": "No audio transcript was provided; live insight processing is waiting for more chunks.",
+        }
+
+    if chunks:
+        result = evaluate_chunked_replay(chunks, request.call_id, request.conversation_state or {})
+        return {
+            **result,
+            "mode": request.mode,
+            "notes": "Chunked replay processed incrementally; active nudges are available during replay via chunk_events.",
         }
 
     signals = extract_call_signals(transcript, request.conversation_state or {})
@@ -269,6 +369,16 @@ def process_live_audio_stream(payload: dict[str, Any] | AudioStreamRequest) -> d
         "signals": signals,
         "nudges": nudges,
         "latency": latency,
+        "chunk_events": [{
+            "chunk_index": 0,
+            "chunk_id": request.call_id or "chunk_0",
+            "timestamp_ms": 0,
+            "duration_ms": 0.0,
+            "transcript": transcript,
+            "signals": signals,
+            "active_nudges": nudges,
+            "processing_latency_ms": latency["total_ms"],
+        }],
         "pipeline": "chunked_replay",
         "notes": "This is a chunked replay / local pipeline simulation; real microphone capture would require an ASR provider and a streaming transport.",
         "confidence_threshold": DEFAULT_NUDGE_THRESHOLD,

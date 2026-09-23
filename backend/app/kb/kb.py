@@ -1,6 +1,7 @@
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -58,13 +59,131 @@ def chunk_text(text: str, size: int = 600, overlap: int = 120) -> list[str]:
     return splitter.split_text(text)
 
 
-def ingest_json(path: str | None = None) -> dict[str, Any]:
-    resolved_path = Path(path or "/data/raw/loan_knowledge.json")
-    records = json.loads(resolved_path.read_text())
+def _normalize_text(value: str | None) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip())
+
+
+def _redact_pii(value: str) -> tuple[str, bool]:
+    cleaned = value or ""
+    email_pattern = r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"
+    phone_pattern = r"(?<!\w)(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{2,4}\)?[-.\s]?){2,}\d{3,4}(?!\w)"
+    id_pattern = r"\b(?:\d{3}-\d{2}-\d{4}|\d{9,}\b)"
+    found_pii = bool(re.search(email_pattern, cleaned) or re.search(phone_pattern, cleaned) or re.search(id_pattern, cleaned))
+    cleaned = re.sub(email_pattern, "[email redacted]", cleaned)
+    cleaned = re.sub(phone_pattern, "[phone redacted]", cleaned)
+    cleaned = re.sub(id_pattern, "[id redacted]", cleaned)
+    return cleaned, found_pii
+
+
+def prepare_records_for_ingestion(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str, str, str, str]] = set()
+    cleaned_records: list[dict[str, Any]] = []
+
+    for raw_record in records or []:
+        if not isinstance(raw_record, dict):
+            continue
+        record_id = str(raw_record.get("record_id") or "unknown_record").strip() or "unknown_record"
+        title = _normalize_text(raw_record.get("title") or record_id)
+        category = _normalize_text(raw_record.get("category") or "general")
+        source = _normalize_text(raw_record.get("source") or "unknown")
+        version = str(raw_record.get("version") or "1.0").strip() or "1.0"
+        content = _normalize_text(raw_record.get("content") or "")
+        content, pii_flag = _redact_pii(content)
+        pii_flag = bool(raw_record.get("pii", False)) or pii_flag
+
+        key = (
+            record_id,
+            title.lower(),
+            category.lower(),
+            source.lower(),
+            content.lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+
+        cleaned_records.append(
+            {
+                "record_id": record_id,
+                "title": title,
+                "category": category,
+                "source": source,
+                "version": version,
+                "content": content,
+                "pii": pii_flag,
+            }
+        )
+
+    return cleaned_records
+
+
+def _read_document_text(path: str | Path) -> str:
+    resolved_path = Path(path)
+    suffix = resolved_path.suffix.lower()
+    ocr_notice = " OCR is not supported for scanned PDFs in this repository."
+
+    if suffix == ".json":
+        payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+        if isinstance(payload, list):
+            return json.dumps(payload)
+        if isinstance(payload, dict):
+            if isinstance(payload.get("records"), list):
+                return json.dumps(payload["records"])
+            if payload.get("content"):
+                return str(payload["content"])
+        raise ValueError("Unsupported JSON document payload. Expected a list of records or a content field.")
+
+    if suffix in {".txt", ".md", ".csv"}:
+        content = resolved_path.read_text(encoding="utf-8", errors="replace")
+        if not content.strip():
+            raise ValueError("No readable text was extracted from the uploaded file.")
+        return content
+
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            raise ValueError("PDF parsing requires pypdf, which is not available in the selected environment.") from None
+
+        try:
+            reader = PdfReader(str(resolved_path))
+            pages = [page.extract_text() or "" for page in reader.pages]
+        except Exception as exc:  # pragma: no cover - exercised through runtime PDF validation
+            raise ValueError(f"Could not read the uploaded PDF: {exc}. OCR is not supported for scanned PDFs in this repository.") from exc
+
+        text = "\n\n".join(page for page in pages if page.strip())
+        if not text.strip():
+            raise ValueError(
+                "No readable text was extracted from the uploaded PDF. The file may be empty, scanned, or corrupt."
+                + ocr_notice
+            )
+        return text
+
+    raise ValueError(f"Unsupported document type: {suffix or 'unknown'}")
+
+
+def _build_record_from_document(path: str | Path, title: str | None = None, category: str | None = None, source: str | None = None) -> dict[str, Any]:
+    resolved_path = Path(path)
+    stem = resolved_path.stem or "uploaded_document"
+    record_id = re.sub(r"[^a-z0-9]+", "_", stem.lower()).strip("_") or "uploaded_document"
+    text = _read_document_text(resolved_path)
+    return {
+        "record_id": record_id,
+        "title": title or stem.replace("_", " ").strip() or "Uploaded Document",
+        "category": category or "general",
+        "source": source or f"uploaded://{resolved_path.name}",
+        "version": "1.0",
+        "content": text,
+        "pii": False,
+    }
+
+
+def ingest_records(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    cleaned_records = prepare_records_for_ingestion(records)
     vector_store = get_vector_store()
     total_chunks = 0
 
-    for record in records:
+    for record in cleaned_records:
         metadata = {
             "record_id": record["record_id"],
             "title": record["title"],
@@ -108,7 +227,28 @@ def ingest_json(path: str | None = None) -> dict[str, Any]:
             conn.commit()
         total_chunks += len(chunks)
 
-    return {"ingested_records": len(records), "ingested_chunks": total_chunks}
+    return {"ingested_records": len(cleaned_records), "ingested_chunks": total_chunks}
+
+
+def ingest_json(path: str | None = None) -> dict[str, Any]:
+    resolved_path = Path(path or "/data/raw/loan_knowledge.json")
+    records = json.loads(resolved_path.read_text(encoding="utf-8"))
+    if isinstance(records, dict) and isinstance(records.get("records"), list):
+        records = records["records"]
+    return ingest_records(records)
+
+
+def ingest_document_file(path: str | Path, title: str | None = None, category: str | None = None, source: str | None = None) -> dict[str, Any]:
+    resolved_path = Path(path)
+    if resolved_path.suffix.lower() == ".json":
+        payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+        if isinstance(payload, list):
+            return ingest_records(payload)
+        if isinstance(payload, dict) and isinstance(payload.get("records"), list):
+            return ingest_records(payload["records"])
+
+    record = _build_record_from_document(path, title=title, category=category, source=source)
+    return ingest_records([record])
 
 
 def retrieve(question: str, limit: int = 4) -> list[dict[str, Any]]:

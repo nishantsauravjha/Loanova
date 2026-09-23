@@ -12,5 +12,6 @@ pgvector
 python-dotenv
 pydantic
 python-multipart
+pypdf
 streamlit
 requests
