@@ -256,6 +256,11 @@ If the Streamlit UI does not connect to the backend in a browser, make sure the 
 
 ## Frontend conversation UI
 
+<img width="2936" height="1460" alt="image" src="https://github.com/user-attachments/assets/89223a03-4181-41d8-8d27-572d284a4e86" />
+
+<img width="2928" height="1476" alt="image" src="https://github.com/user-attachments/assets/a27e9396-ec4a-40ab-b099-49dc4bf62e7a" />
+
+
 The Streamlit frontend in [frontend/streamlit_app.py](frontend/streamlit_app.py) connects to the existing `/voice/conversation` API and shows:
 
 - user and assistant messages in a chat layout
